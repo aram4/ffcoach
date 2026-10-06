@@ -1,0 +1,79 @@
+# ffcoach
+
+A weekly assistant for ESPN fantasy football. It reads every roster in your league and tells you:
+
+- **Matchup:** your optimal projection vs. your opponent's, rough win odds, and their injured or bye-week starters.
+- **Start/sit:** the best lineup for this week vs. what you have set, plus questionable players to re-check before lock.
+- **Waivers:** a stacked add/drop plan (each move assumes the one above went through), plus an automatic fill for any empty slot.
+- **Trades:** 1-for-1, 2-for-1 and 1-for-2 deals where **both** starting lineups improve, with a one-line pitch for the other manager.
+
+It also comes with **ffchat**, a chat where you ask about your league in plain English. Each question is routed to the right model: quick lookups ("is Jefferson playing?") go to Claude Sonnet 5.5, and strategy questions (trades, pickups, start/sit) go to Claude Opus 5.5. See [Ask it questions](#ask-it-questions-ffchat).
+
+## Setup (5 minutes)
+
+```bash
+pip install espn-api            # plus `anthropic` if you want --narrate
+cp .env.example .env
+```
+
+Fill in `.env`:
+
+| Variable | Where to find it |
+|---|---|
+| `ESPN_LEAGUE_ID` | Your league URL: `fantasy.espn.com/football/league?leagueId=`**`12345`** |
+| `ESPN_TEAM_ID` | Click your team; the URL has `teamId=`**`3`** |
+| `ESPN_S2`, `ESPN_SWID` | Private leagues only. Log in at fantasy.espn.com, open DevTools → Application → Cookies → `espn.com`, copy `espn_s2` and `SWID` (keep the braces in SWID). |
+
+The cookies are your login. Keep `.env` out of git. They last about a year.
+
+## Run
+
+```bash
+python ffcoach.py --demo          # try it on a fake league first
+python ffcoach.py                 # full report for your league
+python ffcoach.py --sms           # 6-line version for a text message
+python ffcoach.py --narrate       # adds a short LLM-written brief (needs ANTHROPIC_API_KEY)
+python ffcoach.py --json out.json # raw analysis, for logging or backtesting
+```
+
+## Ask it questions (ffchat)
+
+`ffchat.py` lets you ask about your league in plain English. Claude reads your live rosters, matchups and free agents through a few tools and does the reasoning itself. The one piece of math left in code is trade scoring (`evaluate_trade`), because re-solving both teams' best lineups is easy to get wrong by hand.
+
+Each question is routed by a quick Haiku check: lookups go to Claude Sonnet 5.5, strategy (trades, pickups, start/sit) to Claude Opus 5.5.
+
+```bash
+pip install anthropic            # and put ANTHROPIC_API_KEY in .env
+python3 ffchat.py                # interactive chat
+python3 ffchat.py "should I start Puka or Waddle this week?"
+python3 ffchat.py -v "find me a trade for a better RB"   # -v shows routing and tool calls
+python3 ffchat.py --model claude-opus-5-5                # skip routing, use one model
+```
+
+Optional `.env` settings: `FFCOACH_EFFORT` (Opus, default `high`) and `FFCOACH_SIMPLE_EFFORT` (Sonnet, default `medium`).
+
+What it can't know: breaking news, practice reports and weather. It only sees what ESPN's data has when you ask.
+
+## Hook it into OpenClaw
+
+Have OpenClaw run `python ffcoach.py --sms` and text you the output on two schedules:
+- **Tuesday ~8pm CT**, before waivers process: waiver plan and trade ideas.
+- **Thursday ~5pm CT**, before TNF lock, and **Sunday ~11am CT**: start/sit and injury checks.
+
+For texting questions, add an OpenClaw skill that runs on incoming fantasy messages:
+
+```bash
+python /path/to/ffcoach/ffchat.py --sms --session ~/.ffchat-session.json "<the text you sent>"
+```
+
+and replies with whatever it prints. `--sms` keeps answers text-length. `--session` remembers the last few exchanges for two hours, so "what about at flex?" works as a follow-up. Use a prefix like `ff:` so OpenClaw knows which texts to route here.
+
+## How it decides (and where it's weak)
+
+- **Player value** blends ESPN's season-projection average (60%) with the actual average so far (40%). Change `ROS_PROJ_WEIGHT` to adjust.
+- **Injuries** discount this week's projection: Questionable 85%, Doubtful 25%, Out/IR 0.
+- **Trades** only count rest-of-season *starting lineup* points, so bench depth is worth zero. That's deliberate: it keeps you from trading for players you won't start. It does undervalue insurance late in the season, though.
+- **Win odds** are a normal approximation on the projection gap. Treat them as directional, not exact.
+- It uses ESPN's unofficial API through `espn-api`. If ESPN changes something, update the library first.
+
+The obvious next upgrade is **backtesting**: save `--json` every week, then compare the start/sit calls against actual scores, so you know whether the tool beats your gut.
