@@ -99,6 +99,7 @@ class League:
     teams: dict[int, Team]
     matchups: dict[int, int]     # team_id -> opponent team_id for this week
     free_agents: list[P] = field(default_factory=list)
+    espn: object = field(default=None, repr=False)   # raw espn_api League, for history lookups
 
 
 # ----------------------------------------------------------------------------
@@ -415,7 +416,121 @@ def load_espn(league_id: int, year: int, espn_s2: str | None, swid: str | None,
         sys.exit(f"No matchup found for your team in week {week} (bye week?).")
 
     return League(name=lg.settings.name, week=week, slots=slots,
-                  teams=teams, matchups=matchups, free_agents=fas)
+                  teams=teams, matchups=matchups, free_agents=fas, espn=lg)
+
+
+HISTORY_TYPES = ["FREEAGENT", "WAIVER", "WAIVER_ERROR", "ROSTER", "TRADE_PROPOSAL",
+                 "TRADE_ACCEPT", "TRADE_DECLINE", "TRADE_VETO", "TRADE_UPHOLD"]
+
+
+def load_history(lg: League) -> dict:
+    """Every manager's moves this season: waiver bids (won and lost), free-agent pickups,
+    completed trades, trade offers and responses, lineup activity and early draft picks."""
+    from datetime import datetime
+    esp = lg.espn
+    team_name = {t.team_id: t.name for t in lg.teams.values()}
+    pos = {p.name: p.pos for t in lg.teams.values() for p in t.roster}
+    pos.update({p.name: p.pos for p in lg.free_agents})
+
+    def player(pid):
+        n = esp.player_map.get(pid, str(pid))
+        return f"{n} ({pos[n]})" if n in pos else n
+
+    def day(ms):
+        return datetime.fromtimestamp(ms / 1000).strftime("%b %d") if ms else None
+
+    raw = {}
+    # ESPN files transactions by scoring period (week); 0 is preseason.
+    for wk in range(esp.current_week + 1):
+        data = esp.espn_request.league_get(
+            params={"view": "mTransactions2", "scoringPeriodId": wk},
+            headers={"x-fantasy-filter": json.dumps({"transactions": {"filterType": {"value": HISTORY_TYPES}}})})
+        for t in data.get("transactions", []):
+            raw[t["id"]] = t
+
+    budget = getattr(esp.settings, "acquisition_budget", 0) or 0
+    mgrs = {}
+    for et in esp.teams:
+        mgrs[et.team_id] = {
+            "team": team_name.get(et.team_id, et.team_name), "record": f"{et.wins}-{et.losses}",
+            "playoff_seed": et.standing, "waiver_priority": et.waiver_rank,
+            "faab_left": budget - et.acquisition_budget_spent if budget else None,
+            "lineup_changes_by_week": {}, "waiver_bids": [], "free_agent_moves": [],
+            "trades_completed": [], "trade_offers_made": [], "trade_offers_received": [],
+            "trade_responses": {"accepted": 0, "declined": 0},
+            "early_draft_picks": [],
+        }
+    contests: dict[str, list] = {}
+
+    for t in sorted(raw.values(), key=lambda t: t.get("proposedDate") or t.get("processDate") or 0):
+        m = mgrs.get(t["teamId"])
+        if not m:
+            continue
+        items = t.get("items") or []
+        adds = [player(i["playerId"]) for i in items if i["type"] == "ADD"]
+        drops = [player(i["playerId"]) for i in items if i["type"] == "DROP"]
+        wk, status, typ = t.get("scoringPeriodId"), t.get("status"), t["type"]
+        if typ == "WAIVER":
+            won = status == "EXECUTED"
+            bid = {"week": wk, "add": adds[0] if adds else None, "drop": drops or None,
+                   "bid": t.get("bidAmount"), "result": "won" if won else status.replace("FAILED_", "lost: ").lower()}
+            m["waiver_bids"].append(bid)
+            if adds:
+                contests.setdefault(f"wk{wk} {adds[0]}", []).append(
+                    {"team": m["team"], "bid": t.get("bidAmount"), "won": won})
+        elif typ == "FREEAGENT" and status == "EXECUTED":
+            m["free_agent_moves"].append({"week": wk, "add": adds, "drop": drops})
+        elif typ == "ROSTER" and any(i["type"] == "LINEUP" for i in items):
+            m["lineup_changes_by_week"][wk] = m["lineup_changes_by_week"].get(wk, 0) + 1
+        elif typ == "TRADE_PROPOSAL" and items:
+            sides: dict[int, list] = {}
+            for i in items:
+                if i["type"] == "ACQUISITION_BUDGET_TRADE":
+                    what = f"${i.get('bidAmount', '?')} FAAB"
+                else:
+                    what = player(i["playerId"]) if i["playerId"] else "draft pick"
+                sides.setdefault(i["fromTeamId"], []).append(what)
+            other = next((tid for tid in sides if tid != t["teamId"]), None)
+            # ESPN only shows some offers, and their outcome isn't always linked, so `status` is as-is.
+            offer = {"week": wk, "date": day(t.get("proposedDate")), "status": status.lower() if status else None,
+                     "from": m["team"], "to": team_name.get(other),
+                     "offered": sides.get(t["teamId"], []), "asked_for": sides.get(other, [])}
+            m["trade_offers_made"].append(offer)
+            if other in mgrs:
+                mgrs[other]["trade_offers_received"].append(offer)
+        elif typ == "TRADE_ACCEPT":
+            m["trade_responses"]["accepted"] += 1
+        elif typ == "TRADE_DECLINE":
+            m["trade_responses"]["declined"] += 1
+
+    # Completed trades are clearest in the activity feed, which names both sides.
+    offset = 0
+    while True:
+        batch = esp.recent_activity(size=100, offset=offset, msg_type="TRADED")
+        for a in batch:
+            got: dict[str, list] = {}
+            for tm, action, p, _ in a.actions:
+                if action == "TRADE_RECEIVED" and tm:
+                    got.setdefault(tm.team_name, []).append(f"{p.name} ({p.position})" if hasattr(p, "name") else str(p))
+            for et in esp.teams:
+                if et.team_name in got:
+                    mgrs[et.team_id]["trades_completed"].append({"date": day(a.date), "received": got})
+        if len(batch) < 100:
+            break
+        offset += 100
+
+    for pick in esp.draft:
+        m = mgrs.get(pick.team.team_id) if pick.team else None
+        if m and pick.round_num <= 6:
+            m["early_draft_picks"].append(
+                {"round": pick.round_num, "player": f"{pick.playerName} ({pos.get(pick.playerName, '?')})",
+                 **({"auction_price": pick.bid_amount} if pick.bid_amount else {})})
+
+    return {
+        "faab_budget": budget or None,
+        "managers": list(mgrs.values()),
+        "contested_waiver_claims": {k: v for k, v in contests.items() if len(v) > 1},
+    }
 
 
 # ----------------------------------------------------------------------------

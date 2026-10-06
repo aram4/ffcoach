@@ -59,6 +59,7 @@ class LeagueData:
                 my_team_id=self.my_id,
             )
         self.loaded_at = time.strftime("%a %H:%M")
+        self.history = None
 
     @property
     def me(self) -> fc.Team:
@@ -133,12 +134,21 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {
          "position": {"type": "string"}, "sort": {"type": "string", "enum": ["week", "ros"]},
          "limit": {"type": "integer"}}}},
-    {"name": "evaluate_trade",
-     "description": "Score a trade between the user and one other team: how each side's best starting lineup "
-                    "changes in rest-of-season points/week and this-week points. Use it to check any trade idea.",
-     "input_schema": {"type": "object", "properties": {
-         "give": {"type": "array", "items": {"type": "string"}},
-         "get": {"type": "array", "items": {"type": "string"}}}, "required": ["give", "get"]}},
+    {"name": "evaluate_trades",
+     "description": "Score trades between the user and other teams: how each side's best starting lineup changes "
+                    "in rest-of-season points/week and this-week points. Pass every idea you want checked in one call.",
+     "input_schema": {"type": "object", "properties": {"trades": {"type": "array", "items": {
+         "type": "object", "properties": {
+             "give": {"type": "array", "items": {"type": "string"}},
+             "get": {"type": "array", "items": {"type": "string"}}}, "required": ["give", "get"]}}},
+         "required": ["trades"]}},
+    {"name": "manager_history",
+     "description": "How each manager behaves: every waiver bid (won and lost, with amounts), free-agent moves, "
+                    "completed trades, trade offers made and received, accept/decline counts, lineup changes per "
+                    "week, FAAB left, waiver priority and early draft picks. Also lists contested waiver claims with "
+                    "every bid. teams: names or ['all'].",
+     "input_schema": {"type": "object", "properties": {"teams": {"type": "array", "items": {"type": "string"}}},
+                      "required": ["teams"]}},
     {"name": "refresh_data",
      "description": "Re-download league data from ESPN, e.g. after a trade or waiver claim.",
      "input_schema": {"type": "object", "properties": {}}},
@@ -171,8 +181,24 @@ def run_tool(d: LeagueData, name: str, args: dict):
         key = fc.ros_key if args.get("sort") == "ros" else fc.week_key
         pool = [p for p in lg.free_agents if not pos or p.pos == pos]
         return [pdict(p, d) for p in sorted(pool, key=key, reverse=True)[: args.get("limit", 10)]]
-    if name == "evaluate_trade":
-        return evaluate_trade(d, args["give"], args["get"])
+    if name == "evaluate_trades":
+        out = []
+        for t in args["trades"]:
+            try:
+                out.append({"give": t["give"], "get": t["get"], **evaluate_trade(d, t["give"], t["get"])})
+            except LookupError as e:
+                out.append({"give": t["give"], "get": t["get"], "error": str(e)})
+        return out
+    if name == "manager_history":
+        if d.demo:
+            return {"note": "No transaction history in demo mode."}
+        if d.history is None:
+            d.history = fc.load_history(lg)
+        h = d.history
+        if args["teams"] == ["all"]:
+            return h
+        wanted = {d.team(q).name for q in args["teams"]}
+        return {**h, "managers": [m for m in h["managers"] if m["team"] in wanted]}
     if name == "refresh_data":
         d.load()
         return {"ok": True, "week": lg.week, "loaded": d.loaded_at}
@@ -209,8 +235,11 @@ This answer comes from Anthropic's Claude model `{model}`. ffchat sends quick lo
 How to work:
 - Ground every fact (projections, injuries, byes, owners, slots, kickoffs) in tool results. Reuse earlier results in this conversation when they cover the question; otherwise call a tool first.
 - Think like a strong manager. Weigh rest-of-season value against this week, positional scarcity, byes, injury risk, correlations with the user's own starters, and their record.
-- Trades: read the other rosters to find teams with surplus where the user is thin and vice versa, then score your best ideas with evaluate_trade. A good offer helps the user and doesn't obviously hurt the other side, or they won't accept.
+- Trades: read the other rosters to find teams with surplus where the user is thin and vice versa, then score all your candidate ideas in a single evaluate_trades call. A good offer helps the user and doesn't obviously hurt the other side, or they won't accept.
 - Moves: compare free agents at every position against the user's weakest starters and bench.
+- Model the other managers with manager_history. Before recommending a trade, judge how likely that specific manager is to accept: how often they trade, what they've given up and gone after, offers they've made (which show what they want), how they've responded to offers, their record and playoff position, and whether the deal fills a real hole for them. Rank trade ideas by value to the user and by how likely that manager is to accept, and say why.
+- For waiver targets, predict who else will go after each player: managers with a roster need at that position, higher waiver priority or more FAAB left, and a history of bidding on similar players. Suggest FAAB bids based on what this league has actually paid in contested claims.
+- Activity matters: a manager who rarely changes their lineup or makes moves is less likely to answer a trade offer at all.
 - Lineups: build the best lineup yourself from projections and the starting slots. Use kickoff times for late-swap advice.
 - You can't see news, practice reports, inactives or weather. Say so when it matters.
 - If an earlier answer was wrong, correct it plainly. Never invent a mistake or a correction.
@@ -243,11 +272,12 @@ def ask(client, model: str, effort: str, d: LeagueData, history: list, question:
     # Opus/Sonnet thinking blocks stay valid only if earlier turns are unchanged.
     history.append({"role": "user", "content": question})
     for _ in range(MAX_TOOL_ROUNDS):
-        resp = client.messages.create(
-            model=model, max_tokens=16000, system=system_prompt(d, sms, model),
+        with client.messages.stream(
+            model=model, max_tokens=32000, system=system_prompt(d, sms, model),
             tools=TOOLS, messages=history, output_config={"effort": effort},
             cache_control={"type": "ephemeral"},
-        )
+        ) as stream:
+            resp = stream.get_final_message()
         history.append({"role": "assistant",
                         "content": [b.model_dump(mode="json", exclude_none=True) for b in resp.content]})
         if resp.stop_reason == "refusal":

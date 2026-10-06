@@ -38,7 +38,14 @@ python ffcoach.py --json out.json # raw analysis, for logging or backtesting
 
 ## Ask it questions (ffchat)
 
-`ffchat.py` lets you ask about your league in plain English. Claude reads your live rosters, matchups and free agents through a few tools and does the reasoning itself. The one piece of math left in code is trade scoring (`evaluate_trade`), because re-solving both teams' best lineups is easy to get wrong by hand.
+`ffchat.py` lets you ask about your league in plain English. Claude reads your live rosters, matchups and free agents through a few tools and does the reasoning itself. The one piece of math left in code is trade scoring (`evaluate_trades`), because re-solving both teams' best lineups is easy to get wrong by hand.
+
+**It models the other managers.** ffchat reads your league's full transaction history from ESPN: every waiver bid (including losing bids and amounts), free-agent pickups, completed trades, trade offers made and received, accept/decline counts, lineup activity, FAAB left, waiver priority and draft picks. With that it can:
+- rank trade ideas by how likely *that specific manager* is to accept, not just by value;
+- predict who'll compete for your waiver targets and suggest FAAB bids based on what your league actually pays;
+- flag managers who are inactive and unlikely to answer an offer at all.
+
+ESPN shows some trade offers between other teams but doesn't always link them to their outcome, so acceptance odds lean on each manager's overall trading pattern.
 
 Each question is routed by a quick Haiku check: lookups go to Claude Sonnet 5.5, strategy (trades, pickups, start/sit) to Claude Opus 5.5.
 
@@ -47,6 +54,8 @@ pip install anthropic            # and put ANTHROPIC_API_KEY in .env
 python3 ffchat.py                # interactive chat
 python3 ffchat.py "should I start Puka or Waddle this week?"
 python3 ffchat.py -v "find me a trade for a better RB"   # -v shows routing and tool calls
+python3 ffchat.py "which trades is each manager most likely to accept?"
+python3 ffchat.py "who else will bid on the RB I want, and how much should I bid?"
 python3 ffchat.py --model claude-opus-5-5                # skip routing, use one model
 ```
 
