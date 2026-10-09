@@ -1,0 +1,3 @@
+espn-api
+anthropic
+streamlit

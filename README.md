@@ -63,6 +63,39 @@ Optional `.env` settings: `FFCOACH_EFFORT` (Opus, default `high`) and `FFCOACH_S
 
 What it can't know: breaking news, practice reports and weather. It only sees what ESPN's data has when you ask.
 
+## Web app (share with friends in your league)
+
+`app.py` puts ffchat behind a password-protected web page. Everyone signs in with their own name and password, gets advice for their own team, and is limited to a few questions a day on your API key, unless they paste their own key in the sidebar.
+
+**Deploy on Streamlit Community Cloud (free):**
+1. Go to [share.streamlit.io](https://share.streamlit.io), sign in with GitHub, and click **Create app**.
+2. Pick this repo, branch `main`, main file `app.py`.
+3. Under **Advanced settings → Secrets**, paste your settings (format below) and deploy.
+4. Share the app link plus each friend's name and password.
+
+**Secrets format** (also works locally as `.streamlit/secrets.toml`, which is git-ignored):
+
+```toml
+ANTHROPIC_API_KEY = "sk-ant-..."
+ESPN_LEAGUE_ID = "12345"
+ESPN_TEAM_ID = "3"            # your team; used to load the league
+ESPN_YEAR = "2026"
+ESPN_S2 = "..."
+ESPN_SWID = "{...}"
+DAILY_LIMIT = 10              # questions per person per day on your key
+UNLIMITED_USERS = ["you"]     # no daily limit
+
+[users]                       # name = password
+you = "pick-a-password"
+friend = "another-password"
+
+[user_teams]                  # lock each person to their ESPN team ID; anyone not listed picks from a dropdown
+you = 3
+friend = 6
+```
+
+Run it locally with `streamlit run app.py`. The daily counter lives in memory, so it resets if the app restarts. Each person's conversation is private to their browser session, but anyone in the league who uses it can get trade advice aimed at you.
+
 ## Hook it into OpenClaw
 
 Have OpenClaw run `python ffcoach.py --sms` and text you the output on two schedules:

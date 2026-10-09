@@ -40,18 +40,20 @@ If unsure, say strategy."""
 
 
 class LeagueData:
-    def __init__(self, demo: bool):
+    def __init__(self, demo: bool, team_id: int | None = None):
         self.demo = demo
+        self.team_id = team_id
         self.load()
 
     def load(self):
         if self.demo:
             self.lg, self.my_id = fc.load_demo()
         else:
-            missing = [k for k in ("ESPN_LEAGUE_ID", "ESPN_TEAM_ID") if not os.environ.get(k)]
+            need = ("ESPN_LEAGUE_ID",) if self.team_id else ("ESPN_LEAGUE_ID", "ESPN_TEAM_ID")
+            missing = [k for k in need if not os.environ.get(k)]
             if missing:
                 sys.exit(f"Set {', '.join(missing)} in .env (see README). Or try --demo.")
-            self.my_id = int(os.environ["ESPN_TEAM_ID"])
+            self.my_id = self.team_id or int(os.environ["ESPN_TEAM_ID"])
             self.lg = fc.load_espn(
                 league_id=int(os.environ["ESPN_LEAGUE_ID"]),
                 year=int(os.environ.get("ESPN_YEAR", "2026")),
@@ -152,6 +154,8 @@ TOOLS = [
     {"name": "refresh_data",
      "description": "Re-download league data from ESPN, e.g. after a trade or waiver claim.",
      "input_schema": {"type": "object", "properties": {}}},
+    # Runs on Anthropic's servers; results come back inside the response, not through run_tool.
+    {"type": "web_search_20260209", "name": "web_search", "max_uses": 10},
 ]
 
 
@@ -228,7 +232,7 @@ def evaluate_trade(d: LeagueData, give_names: list[str], get_names: list[str]) -
 def system_prompt(d: LeagueData, sms: bool, model: str) -> str:
     style = ("Reply in under 320 characters, plain text, no markdown: it's going out as a text message."
              if sms else "Lead with the answer, then the 2-5 points that drove it. Light markdown is fine.")
-    return f"""You are ffchat, a fantasy football advisor for the manager of '{d.me.name}' in an ESPN league (week {d.lg.week}).
+    return f"""You are ffchat, a fantasy football advisor for the manager of '{d.me.name}' in an ESPN league (week {d.lg.week}). Today is {time.strftime("%A, %B %d, %Y")}.
 
 This answer comes from Anthropic's Claude model `{model}`. ffchat sends quick lookups to Claude Sonnet 5.5 (`claude-sonnet-5-5`) and strategy questions to Claude Opus 5.5 (`claude-opus-5-5`), so earlier answers may have come from the other model. Never "correct" an earlier answer about which model gave it.
 
@@ -241,7 +245,7 @@ How to work:
 - For waiver targets, predict who else will go after each player: managers with a roster need at that position, higher waiver priority or more FAAB left, and a history of bidding on similar players. Suggest FAAB bids based on what this league has actually paid in contested claims.
 - Activity matters: a manager who rarely changes their lineup or makes moves is less likely to answer a trade offer at all.
 - Lineups: build the best lineup yourself from projections and the starting slots. Use kickoff times for late-swap advice.
-- You can't see news, practice reports, inactives or weather. Say so when it matters.
+- ESPN data has injury tags but no news. Use web_search for the latest injury, practice, depth-chart and roster news on players that matter to the answer, especially anyone you're recommending to trade for, trade away, start or pick up. Prefer reports from the last few days, say how recent each one is, and let the news override stale ESPN projections (e.g. a player ruled out or placed on IR). Name the source briefly.
 - If an earlier answer was wrong, correct it plainly. Never invent a mistake or a correction.
 - week_proj is ESPN's projection. ros_pts_per_week blends ESPN's season projection with the actual average so far. Give one clear recommendation and say when a call is close.
 
@@ -267,7 +271,13 @@ def route(client, question: str, history: list, forced: str | None, verbose: boo
 
 
 def ask(client, model: str, effort: str, d: LeagueData, history: list, question: str,
-        sms: bool, verbose: bool) -> str:
+        sms: bool, verbose: bool, log=None) -> str:
+    def note(msg):
+        if verbose:
+            print(f"  · {msg}", file=sys.stderr)
+        if log:
+            log(msg)
+
     # history keeps every block (thinking, tool calls, results) and is only ever appended to:
     # Opus/Sonnet thinking blocks stay valid only if earlier turns are unchanged.
     history.append({"role": "user", "content": question})
@@ -280,16 +290,19 @@ def ask(client, model: str, effort: str, d: LeagueData, history: list, question:
             resp = stream.get_final_message()
         history.append({"role": "assistant",
                         "content": [b.model_dump(mode="json", exclude_none=True) for b in resp.content]})
+        if resp.stop_reason == "pause_turn":   # long server-side search; resend to let it finish
+            continue
         if resp.stop_reason == "refusal":
             return "Claude declined to answer that one. Try rephrasing."
         if resp.stop_reason != "tool_use":
             return "".join(b.text for b in resp.content if b.type == "text").strip()
         results = []
         for b in resp.content:
+            if b.type == "server_tool_use":
+                note(f"{b.name}({json.dumps(b.input)})")
             if b.type != "tool_use":
                 continue
-            if verbose:
-                print(f"  · {b.name}({json.dumps(b.input)})", file=sys.stderr)
+            note(f"{b.name}({json.dumps(b.input)})")
             try:
                 out = json.dumps(run_tool(d, b.name, b.input or {}), default=str)
                 results.append({"type": "tool_result", "tool_use_id": b.id, "content": out})
@@ -335,8 +348,11 @@ def main():
     d = LeagueData(args.demo)
 
     def answer(q):
-        return ask(client, *route(client, q, history, args.model, args.verbose), d, history, q,
-                   args.sms, args.verbose)
+        try:
+            return ask(client, *route(client, q, history, args.model, args.verbose), d, history, q,
+                       args.sms, args.verbose)
+        except anthropic.APIStatusError as e:
+            return f"Claude API error ({e.status_code}): {e.message}"
 
     history = load_session(args.session)
     if args.question:
