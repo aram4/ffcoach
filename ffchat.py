@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import hashlib
 import json
 import os
 import sys
@@ -30,9 +31,12 @@ SESSION_TTL_MIN = 120
 # Lookups go to Sonnet, strategy to Opus; Haiku picks which. --model forces one.
 ROUTES = {
     "simple": ("claude-sonnet-5-5", os.environ.get("FFCOACH_SIMPLE_EFFORT", "medium")),
-    "strategy": ("claude-opus-5-5", os.environ.get("FFCOACH_EFFORT", "high")),
+    "strategy": ("claude-opus-5-5", os.environ.get("FFCOACH_EFFORT", "medium")),
 }
 ROUTER_MODEL = "claude-haiku-4-5"
+PROFILE_MODEL = "claude-sonnet-5-5"
+PROFILE_MAX_AGE_H = 24
+DATA_DIR = os.environ.get("FFCOACH_DATA_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 ROUTER_PROMPT = """Classify a fantasy football question. Reply with one word.
 strategy: needs judgment, e.g. trades, pickups/drops, start/sit, lineup advice, "what should I do".
 simple: a factual lookup, e.g. a projection, injury, owner, roster, record, kickoff time.
@@ -67,6 +71,7 @@ class LeagueData:
             for t in self.lg.espn.teams}
         self.history = None
         self._box_cache = {}
+        self.__dict__.setdefault("context", None)   # profiles + notes, fixed for the session once built
 
     @property
     def me(self) -> fc.Team:
@@ -175,11 +180,16 @@ TOOLS = [
                     "every bid. teams: names or ['all'].",
      "input_schema": {"type": "object", "properties": {"teams": {"type": "array", "items": {"type": "string"}}},
                       "required": ["teams"]}},
+    {"name": "save_manager_note",
+     "description": "Remember something the user learned about another manager, e.g. how they answered an offer "
+                    "or what they said they want or won't do. Saved notes are shown in every future conversation.",
+     "input_schema": {"type": "object", "properties": {"team": {"type": "string"}, "note": {"type": "string"}},
+                      "required": ["team", "note"]}},
     {"name": "refresh_data",
      "description": "Re-download league data from ESPN, e.g. after a trade or waiver claim.",
      "input_schema": {"type": "object", "properties": {}}},
     # Runs on Anthropic's servers; results come back inside the response, not through run_tool.
-    {"type": "web_search_20260209", "name": "web_search", "max_uses": 10},
+    {"type": "web_search_20250305", "name": "web_search", "max_uses": 10},
 ]
 
 
@@ -233,6 +243,10 @@ def run_tool(d: LeagueData, name: str, args: dict):
             return h
         wanted = {d.team(q).name for q in args["teams"]}
         return {**h, "managers": [m for m in h["managers"] if m["team"] in wanted]}
+    if name == "save_manager_note":
+        t = d.team(args["team"])
+        save_note(d.my_id, t.name, args["note"])
+        return {"saved": True, "team": t.name}
     if name == "refresh_data":
         d.load()
         return {"ok": True, "week": lg.week, "loaded": d.loaded_at}
@@ -327,6 +341,127 @@ def evaluate_trade(d: LeagueData, give_names: list[str], get_names: list[str]) -
     return res
 
 
+def _data_path(kind: str) -> str:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    return os.path.join(DATA_DIR, f"{kind}-{os.environ.get('ESPN_LEAGUE_ID', 'demo')}.json")
+
+
+# Notes are private to the person who wrote them (keyed by their team), unlike the shared profiles.
+def load_notes(owner_team_id: int) -> dict:
+    path = _data_path(f"notes-team{owner_team_id}")
+    return json.load(open(path)) if os.path.exists(path) else {}
+
+
+def save_note(owner_team_id: int, team: str, note: str):
+    notes = load_notes(owner_team_id)
+    notes.setdefault(team, []).append({"date": time.strftime("%Y-%m-%d"), "note": note})
+    json.dump(notes, open(_data_path(f"notes-team{owner_team_id}"), "w"), indent=1)
+
+
+def manager_stats(d: LeagueData) -> list[dict]:
+    weeks_played = max(d.lg.espn.current_week - 1, 1)
+    out = []
+    for m in d.history["managers"]:
+        bids = m["waiver_bids"]
+        won = [b["bid"] or 0 for b in bids if b["result"] == "won"]
+        positions = [a.rsplit("(", 1)[-1].rstrip(")") for a in
+                     [b["add"] for b in bids if b["add"]] + [x for mv in m["free_agent_moves"] for x in mv["add"]]
+                     if "(" in a]
+        out.append({
+            "team": m["team"], "manager": m["manager"], "faab_left": m["faab_left"],
+            "waiver_priority": m["waiver_priority"], "trades_completed": len(m["trades_completed"]),
+            "offers_made": len(m["trade_offers_made"]), "offers_received": len(m["trade_offers_received"]),
+            **m["trade_responses"], "waiver_bids": len(bids), "bids_won": len(won),
+            "avg_winning_bid": round(sum(won) / len(won), 1) if won else None,
+            "max_bid": max((b["bid"] or 0 for b in bids), default=None),
+            "positions_added": {p: positions.count(p) for p in sorted(set(positions))},
+            "lineup_changes_per_week": round(sum(m["lineup_changes_by_week"].values()) / weeks_played, 1),
+        })
+    return out
+
+
+def roster_line(d: LeagueData, team: fc.Team) -> str:
+    """One compact line per team for the prompt: starters first, then bench."""
+    _, lineup = fc.best_lineup(team.roster, d.lg.slots, fc.ros_key)
+    starting = [p for ps in lineup.values() for p in ps]
+    bench = sorted((p for p in team.roster if all(p is not s for s in starting)), key=lambda p: -p.ros_value)
+
+    def tag(p):
+        flags = [p.injury.lower().replace("injury_reserve", "IR")] if p.injury not in ("ACTIVE", "NORMAL") else []
+        if p.on_bye:
+            flags.append("bye")
+        return f"{p.name} {p.pos} {p.ros_value:.1f}/{p.week_value:.1f}" + (f" [{', '.join(flags)}]" if flags else "")
+    manager = d.managers.get(team.team_id, "")
+    return (f"- {team.name} ({manager}, {team.record}): " + "; ".join(tag(p) for p in starting)
+            + " | bench: " + "; ".join(tag(p) for p in bench))
+
+
+def roster_summary(d: LeagueData, team: fc.Team) -> str:
+    _, lineup = fc.best_lineup(team.roster, d.lg.slots, fc.ros_key)
+    starting = {id(p) for ps in lineup.values() for p in ps}
+
+    def tag(p):
+        return f"{p.name} {p.ros_value:.1f}" + (f" {p.injury.lower()}" if p.injury not in ("ACTIVE", "NORMAL") else "")
+    starters = "; ".join(f"{s}: " + ", ".join(tag(p) for p in ps) for s, ps in lineup.items())
+    bench = ", ".join(f"{tag(p)} ({p.pos})" for p in team.roster if id(p) not in starting)
+    return f"starters {starters} | bench {bench}"
+
+
+PROFILE_PROMPT = """You're writing scouting notes on every manager in a fantasy football league. Using only the data below, write one profile per team, about 90 words each, in this format:
+
+### <Team> (<Manager>) · <record>, <ESPN playoff odds>%
+- **Trades:** how active; accept/decline record; what they've offered for, asked for and given up; what kind of pitch lands.
+- **Waivers:** FAAB left; how aggressively they bid (typical and max); positions they chase.
+- **Roster:** biggest needs and surpluses right now.
+- **Read:** one line on how to deal with them.
+
+Say "little data" where it's thin. No intro or summary."""
+
+
+def build_context(client, d: LeagueData, force: bool = False, log=None) -> str:
+    """Manager profiles (rebuilt only when league activity changes or they're a day old) plus the user's notes."""
+    if d.demo:
+        return ""
+    if d.history is None:
+        d.history = fc.load_history(d.lg)
+    activity = {m["team"]: {k: v for k, v in m.items() if k != "lineup_changes_by_week"}
+                for m in d.history["managers"]}
+    rosters = {t.name: sorted(p.name for p in t.roster) for t in d.lg.teams.values()}
+    fingerprint = hashlib.sha1(json.dumps([activity, rosters], sort_keys=True, default=str).encode()).hexdigest()
+    path = _data_path("profiles")
+    cached = json.load(open(path)) if os.path.exists(path) else None
+    fresh = cached and cached["fingerprint"] == fingerprint and time.time() - cached["built"] < PROFILE_MAX_AGE_H * 3600
+    if force or not fresh:
+        if log:
+            log("building manager profiles (only when the league changes)")
+        data = {
+            "standings": [{k: t[k] for k in ("team", "manager", "record", "points_for", "points_against",
+                                             "espn_playoff_pct")} for t in standings(d)["teams"]],
+            "stats": manager_stats(d),
+            "rosters_by_rest_of_season_value": {t.name: roster_summary(d, t) for t in d.lg.teams.values()},
+            "history": d.history,
+        }
+        with client.messages.stream(
+            model=PROFILE_MODEL, max_tokens=32000, output_config={"effort": "medium"},
+            system=PROFILE_PROMPT,
+            messages=[{"role": "user", "content": json.dumps(data, default=str)}],
+        ) as stream:
+            msg = stream.get_final_message()
+        if msg.stop_reason != "end_turn":
+            raise RuntimeError(f"Profile build stopped early ({msg.stop_reason}); not caching it.")
+        text = "".join(b.text for b in msg.content if b.type == "text").strip()
+        cached = {"fingerprint": fingerprint, "built": time.time(), "text": text}
+        json.dump(cached, open(path, "w"), indent=1)
+    others = [s for s in cached["text"].split("### ") if s.strip() and not s.startswith(d.me.name)]
+    notes = load_notes(d.my_id)
+    notes_text = "\n".join(f"- {team}: {n['note']} ({n['date']})" for team, ns in notes.items() for n in ns)
+    built = time.strftime("%b %d %H:%M", time.localtime(cached["built"]))
+    rosters = "\n".join(roster_line(d, t) for t in d.lg.teams.values())
+    return (f"## Rosters at {d.loaded_at} (best rest-of-season lineup first; numbers are rest-of-season pts/week / this week's projection)\n\n{rosters}\n\n"
+            f"## Manager profiles (built {built} from league activity)\n\n" + "### ".join([""] + others).strip() + "\n\n"
+            f"## What the user has learned about other managers\n\n{notes_text or 'Nothing yet.'}")
+
+
 def system_prompt(d: LeagueData, sms: bool, model: str) -> str:
     style = ("Reply in under 320 characters, plain text, no markdown: it's going out as a text message."
              if sms else "Lead with the answer, then the 2-5 points that drove it. Light markdown is fine.")
@@ -339,10 +474,11 @@ This answer comes from Anthropic's Claude model `{model}`. ffchat sends quick lo
 How to work:
 - Ground every fact (projections, injuries, byes, owners, slots, kickoffs) in tool results. Reuse earlier results in this conversation when they cover the question; otherwise call a tool first.
 - Think like a strong manager. Weigh rest-of-season value against this week, positional scarcity, byes, injury risk, correlations with the user's own starters, and their record.
-- Trades: read the other rosters to find teams with surplus where the user is thin and vice versa, then score all your candidate ideas in a single evaluate_trades call. A good offer helps the user and doesn't obviously hurt the other side, or they won't accept.
+- Trades: scan the roster summaries at the end of these instructions to find teams with surplus where the user is thin and vice versa, then score all your candidate ideas in a single evaluate_trades call. Call get_rosters only for a specific team when you need detail the summary lacks (lineup slots, opponents, kickoffs), or after refresh_data. A good offer helps the user and doesn't obviously hurt the other side, or they won't accept.
 - Past performance: use standings for records, points for/against, ESPN playoff odds and remaining schedules; week_results for past matchups; player_stats for how players have actually scored vs projections. Weigh real production and trends, not just ESPN's projections, and use playoff odds and schedules when judging how urgent a move is.
 - Moves: compare free agents at every position against the user's weakest starters and bench.
-- Model the other managers with manager_history. Before recommending a trade, judge how likely that specific manager is to accept: how often they trade, what they've given up and gone after, offers they've made (which show what they want), how they've responded to offers, their record and playoff position, and whether the deal fills a real hole for them. Rank trade ideas by value to the user and by how likely that manager is to accept, and say why.
+- Other managers: profiles of every manager and the user's own notes are at the end of these instructions. Use them to judge how likely a specific manager is to accept a trade or chase a waiver target, and whether a deal fills a real hole for them. Call manager_history only for specifics such as exact bids or offer contents. Rank trade ideas by value to the user and by how likely that manager is to accept, and say why.
+- When the user reports how a manager responded (declined, countered, said what they want or won't do), save it with save_manager_note. Don't save your own guesses.
 - For waiver targets, predict who else will go after each player: managers with a roster need at that position, higher waiver priority or more FAAB left, and a history of bidding on similar players. Suggest FAAB bids based on what this league has actually paid in contested claims.
 - Activity matters: a manager who rarely changes their lineup or makes moves is less likely to answer a trade offer at all.
 - Lineups: build the best lineup yourself from projections and the starting slots. Use kickoff times for late-swap advice.
@@ -350,7 +486,9 @@ How to work:
 - If an earlier answer was wrong, correct it plainly. Never invent a mistake or a correction.
 - week_proj is ESPN's projection. ros_pts_per_week blends ESPN's season projection with the actual average so far. Give one clear recommendation and say when a call is close.
 
-{style}"""
+{style}
+
+{d.context or ""}"""
 
 
 def route(client, question: str, history: list, forced: str | None, verbose: bool) -> tuple[str, str]:
@@ -381,6 +519,8 @@ def ask(client, model: str, effort: str, d: LeagueData, history: list, question:
 
     # history keeps every block (thinking, tool calls, results) and is only ever appended to:
     # Opus/Sonnet thinking blocks stay valid only if earlier turns are unchanged.
+    if d.context is None:
+        d.context = build_context(client, d, log=note)
     history.append({"role": "user", "content": question})
     for _ in range(MAX_TOOL_ROUNDS):
         with client.messages.stream(
@@ -422,18 +562,18 @@ def log_exchange(user: str, team: str, model: str, question: str, answer: str):
                 f"**Q:** {question}\n\n{answer}\n\n---\n\n")
 
 
-def load_session(path):
+def load_session(path) -> tuple[list, str | None]:
     if not path or not os.path.exists(path):
-        return []
+        return [], None
     s = json.load(open(path))
     if time.time() - s.get("ts", 0) > SESSION_TTL_MIN * 60:
-        return []
-    return s.get("history", [])
+        return [], None
+    return s.get("history", []), s.get("context")
 
 
-def save_session(path, history):
+def save_session(path, history, context):
     if path:
-        json.dump({"ts": time.time(), "history": history}, open(path, "w"))
+        json.dump({"ts": time.time(), "history": history, "context": context}, open(path, "w"))
 
 
 def main():
@@ -445,6 +585,7 @@ def main():
     ap.add_argument("--model", default=os.environ.get("FFCOACH_MODEL") or None,
                     help="use one model for everything instead of routing")
     ap.add_argument("-v", "--verbose", action="store_true", help="show routing and tool calls")
+    ap.add_argument("--rebuild-profiles", action="store_true", help="rebuild manager profiles now")
     args = ap.parse_args()
 
     try:
@@ -456,6 +597,8 @@ def main():
         sys.exit("Set ANTHROPIC_API_KEY in .env (console.anthropic.com → API keys).")
     client = anthropic.Anthropic()
     d = LeagueData(args.demo)
+    if args.rebuild_profiles:
+        d.context = build_context(client, d, force=True)
 
     def answer(q):
         try:
@@ -466,10 +609,10 @@ def main():
         log_exchange(os.environ.get("FFCOACH_USER", "me"), d.me.name, model, q, a)
         return a
 
-    history = load_session(args.session)
+    history, d.context = load_session(args.session)
     if args.question:
         print(answer(" ".join(args.question)))
-        save_session(args.session, history)
+        save_session(args.session, history, d.context)
         return
 
     mode = args.model or "Sonnet for lookups, Opus for strategy"

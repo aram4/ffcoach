@@ -5,3 +5,4 @@ __pycache__/
 *.json
 .streamlit/secrets.toml
 logs/
+data/
