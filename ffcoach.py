@@ -452,7 +452,9 @@ def load_history(lg: League) -> dict:
     mgrs = {}
     for et in esp.teams:
         mgrs[et.team_id] = {
-            "team": team_name.get(et.team_id, et.team_name), "record": f"{et.wins}-{et.losses}",
+            "team": team_name.get(et.team_id, et.team_name),
+            "manager": ", ".join(f"{o.get('firstName', '').strip()} {o.get('lastName', '').strip()}".strip() for o in et.owners),
+            "record": f"{et.wins}-{et.losses}",
             "playoff_seed": et.standing, "waiver_priority": et.waiver_rank,
             "faab_left": budget - et.acquisition_budget_spent if budget else None,
             "lineup_changes_by_week": {}, "waiver_bids": [], "free_agent_moves": [],

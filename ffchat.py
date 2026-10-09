@@ -61,6 +61,10 @@ class LeagueData:
                 my_team_id=self.my_id,
             )
         self.loaded_at = time.strftime("%a %H:%M")
+        self.managers = {} if self.demo else {
+            t.team_id: ", ".join(" ".join(filter(None, (o.get("firstName", "").strip(), o.get("lastName", "").strip())))
+                                 for o in t.owners)
+            for t in self.lg.espn.teams}
         self.history = None
         self._box_cache = {}
 
@@ -78,10 +82,16 @@ class LeagueData:
         match = next((t for n, t in names.items() if ql in n), None)
         if match:
             return match
-        close = difflib.get_close_matches(ql, names, n=1, cutoff=0.4)
+        # People usually refer to other managers by first or full name.
+        by_manager = {m.lower(): self.lg.teams[tid] for tid, m in self.managers.items() if m}
+        match = next((t for m, t in by_manager.items() if ql in m.split() or ql == m), None)
+        if match:
+            return match
+        close = difflib.get_close_matches(ql, list(names) + list(by_manager), n=1, cutoff=0.4)
         if close:
-            return names[close[0]]
-        raise LookupError(f"No team matching '{q}'. Teams: {', '.join(t.name for t in self.lg.teams.values())}")
+            return names.get(close[0]) or by_manager[close[0]]
+        listing = ", ".join(f"{t.name} ({self.managers.get(t.team_id, '?')})" for t in self.lg.teams.values())
+        raise LookupError(f"No team or manager matching '{q}'. Teams: {listing}")
 
     def player(self, q: str) -> fc.P:
         players = [p for t in self.lg.teams.values() for p in t.roster] + self.lg.free_agents
@@ -179,7 +189,7 @@ def run_tool(d: LeagueData, name: str, args: dict):
         return {
             "league": lg.name, "week": lg.week, "data_loaded": d.loaded_at,
             "starting_slots": lg.slots, "your_team": d.me.name,
-            "teams": [{"name": t.name, "record": t.record,
+            "teams": [{"name": t.name, "manager": d.managers.get(t.team_id), "record": t.record,
                        "opponent": lg.teams[lg.matchups[t.team_id]].name if t.team_id in lg.matchups else None}
                       for t in lg.teams.values()],
         }
@@ -238,7 +248,7 @@ def standings(d: LeagueData) -> dict:
                   "opp_score": round(t.scores[w] - t.mov[w], 1), "result": t.outcomes[w]}
                  for w in range(played)]
         teams.append({
-            "team": t.team_name, "seed": t.standing, "record": f"{t.wins}-{t.losses}" + (f"-{t.ties}" if t.ties else ""),
+            "team": t.team_name, "manager": d.managers.get(t.team_id), "seed": t.standing, "record": f"{t.wins}-{t.losses}" + (f"-{t.ties}" if t.ties else ""),
             "points_for": round(t.points_for, 1), "points_against": round(t.points_against, 1),
             "espn_playoff_pct": t.playoff_pct, "streak": f"{t.streak_type[0]}{t.streak_length}",
             "results": weeks, "remaining_opponents": [o.team_name for o in t.schedule[played:esp.settings.reg_season_count]],
@@ -321,6 +331,8 @@ def system_prompt(d: LeagueData, sms: bool, model: str) -> str:
     style = ("Reply in under 320 characters, plain text, no markdown: it's going out as a text message."
              if sms else "Lead with the answer, then the 2-5 points that drove it. Light markdown is fine.")
     return f"""You are ffchat, a fantasy football advisor for the manager of '{d.me.name}' in an ESPN league (week {d.lg.week}). Today is {time.strftime("%A, %B %d, %Y")}.
+
+Managers are often called by first name (e.g. "Omar" or "Ilyas"). league_overview and standings list each team's manager, and any tool that takes a team also accepts a manager's name.
 
 This answer comes from Anthropic's Claude model `{model}`. ffchat sends quick lookups to Claude Sonnet 5.5 (`claude-sonnet-5-5`) and strategy questions to Claude Opus 5.5 (`claude-opus-5-5`), so earlier answers may have come from the other model. Never "correct" an earlier answer about which model gave it.
 

@@ -86,6 +86,8 @@ if st.session_state.get("loaded_team") != team_id:
         st.session_state.league = ch.LeagueData(False, team_id)
     st.session_state.loaded_team = team_id
     st.session_state.chat, st.session_state.history = [], []
+st.session_state.setdefault("chat", [])
+st.session_state.setdefault("history", [])
 d = st.session_state.league
 
 today = datetime.date.today().isoformat()
