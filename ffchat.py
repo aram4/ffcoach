@@ -62,6 +62,7 @@ class LeagueData:
             )
         self.loaded_at = time.strftime("%a %H:%M")
         self.history = None
+        self._box_cache = {}
 
     @property
     def me(self) -> fc.Team:
@@ -144,6 +145,19 @@ TOOLS = [
              "give": {"type": "array", "items": {"type": "string"}},
              "get": {"type": "array", "items": {"type": "string"}}}, "required": ["give", "get"]}}},
          "required": ["trades"]}},
+    {"name": "standings",
+     "description": "League standings: each team's record, points for/against, ESPN playoff odds, seed, streak, "
+                    "every past week's score and result, and remaining opponents. Also playoff spots and season length.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "week_results",
+     "description": "Final scores for a past week: every matchup, and each team's starters with points vs projection "
+                    "plus their best bench scores.",
+     "input_schema": {"type": "object", "properties": {"week": {"type": "integer"}}, "required": ["week"]}},
+    {"name": "player_stats",
+     "description": "Actual fantasy points week by week vs ESPN's projection for each player, plus season total, "
+                    "average and position rank. Use it to judge real performance and trends, not just projections.",
+     "input_schema": {"type": "object", "properties": {"names": {"type": "array", "items": {"type": "string"}}},
+                      "required": ["names"]}},
     {"name": "manager_history",
      "description": "How each manager behaves: every waiver bid (won and lost, with amounts), free-agent moves, "
                     "completed trades, trade offers made and received, accept/decline counts, lineup changes per "
@@ -193,6 +207,12 @@ def run_tool(d: LeagueData, name: str, args: dict):
             except LookupError as e:
                 out.append({"give": t["give"], "get": t["get"], "error": str(e)})
         return out
+    if name == "standings":
+        return standings(d)
+    if name == "week_results":
+        return week_results(d, int(args["week"]))
+    if name == "player_stats":
+        return [player_stats(d, n) for n in args["names"]]
     if name == "manager_history":
         if d.demo:
             return {"note": "No transaction history in demo mode."}
@@ -207,6 +227,74 @@ def run_tool(d: LeagueData, name: str, args: dict):
         d.load()
         return {"ok": True, "week": lg.week, "loaded": d.loaded_at}
     raise LookupError(f"Unknown tool {name}")
+
+
+def standings(d: LeagueData) -> dict:
+    esp = d.lg.espn
+    played = esp.current_week - 1
+    teams = []
+    for t in sorted(esp.teams, key=lambda t: t.standing):
+        weeks = [{"week": w + 1, "vs": t.schedule[w].team_name, "score": round(t.scores[w], 1),
+                  "opp_score": round(t.scores[w] - t.mov[w], 1), "result": t.outcomes[w]}
+                 for w in range(played)]
+        teams.append({
+            "team": t.team_name, "seed": t.standing, "record": f"{t.wins}-{t.losses}" + (f"-{t.ties}" if t.ties else ""),
+            "points_for": round(t.points_for, 1), "points_against": round(t.points_against, 1),
+            "espn_playoff_pct": t.playoff_pct, "streak": f"{t.streak_type[0]}{t.streak_length}",
+            "results": weeks, "remaining_opponents": [o.team_name for o in t.schedule[played:esp.settings.reg_season_count]],
+        })
+    return {"playoff_spots": esp.settings.playoff_team_count, "regular_season_weeks": esp.settings.reg_season_count,
+            "current_week": esp.current_week, "teams": teams}
+
+
+def _box_scores(d: LeagueData, week: int):
+    cache = d.__dict__.setdefault("_box_cache", {})
+    if week not in cache:
+        cache[week] = d.lg.espn.box_scores(week)
+    return cache[week]
+
+
+def week_results(d: LeagueData, week: int) -> dict:
+    if not 1 <= week < d.lg.espn.current_week:
+        raise LookupError(f"Week {week} hasn't finished. Completed weeks: 1-{d.lg.espn.current_week - 1}.")
+
+    def side(team, score, lineup):
+        starters = [p for p in lineup if p.slot_position not in fc.SKIP_SLOTS]
+        bench = sorted((p for p in lineup if p.slot_position == "BE"), key=lambda p: -p.points)
+        return {"team": team.team_name, "score": round(score, 1),
+                "starters": [{"slot": p.slot_position, "name": p.name, "points": round(p.points, 1),
+                              "projected": round(p.projected_points, 1)} for p in starters],
+                "top_bench": [{"name": p.name, "points": round(p.points, 1)} for p in bench[:3]]}
+
+    return {"week": week, "matchups": [
+        {"home": side(b.home_team, b.home_score, b.home_lineup), "away": side(b.away_team, b.away_score, b.away_lineup)}
+        for b in _box_scores(d, week) if b.home_team and b.away_team]}
+
+
+def player_stats(d: LeagueData, name: str) -> dict:
+    p = d.player(name)
+    esp = d.lg.espn
+    weekly = {}
+    for wk in range(1, esp.current_week):
+        for b in _box_scores(d, wk):
+            for bp in (b.home_lineup or []) + (b.away_lineup or []):
+                if bp.name == p.name:
+                    weekly[wk] = {"points": round(bp.points, 1), "projected": round(bp.projected_points, 1)}
+                    if bp.on_bye_week:
+                        weekly[wk]["bye"] = True
+    full = next((rp for t in esp.teams for rp in t.roster if rp.name == p.name), None)
+    if full is None:
+        full = esp.player_info(name=p.name)
+    if full is not None:
+        for wk, st in full.stats.items():
+            if 0 < wk < esp.current_week and wk not in weekly and "points" in st:
+                weekly[wk] = {"points": round(st["points"], 1), "projected": round(st.get("projected_points", 0), 1)}
+    out = {"name": p.name, "pos": p.pos, "owner": d.owner(p),
+           "weekly": {f"week {w}": v for w, v in sorted(weekly.items())}}
+    if full is not None:
+        out.update({"season_total": round(full.total_points, 1), "season_avg": round(full.avg_points, 1),
+                    "pos_rank": getattr(full, "posRank", None)})
+    return out
 
 
 def evaluate_trade(d: LeagueData, give_names: list[str], get_names: list[str]) -> dict:
@@ -240,6 +328,7 @@ How to work:
 - Ground every fact (projections, injuries, byes, owners, slots, kickoffs) in tool results. Reuse earlier results in this conversation when they cover the question; otherwise call a tool first.
 - Think like a strong manager. Weigh rest-of-season value against this week, positional scarcity, byes, injury risk, correlations with the user's own starters, and their record.
 - Trades: read the other rosters to find teams with surplus where the user is thin and vice versa, then score all your candidate ideas in a single evaluate_trades call. A good offer helps the user and doesn't obviously hurt the other side, or they won't accept.
+- Past performance: use standings for records, points for/against, ESPN playoff odds and remaining schedules; week_results for past matchups; player_stats for how players have actually scored vs projections. Weigh real production and trends, not just ESPN's projections, and use playoff odds and schedules when judging how urgent a move is.
 - Moves: compare free agents at every position against the user's weakest starters and bench.
 - Model the other managers with manager_history. Before recommending a trade, judge how likely that specific manager is to accept: how often they trade, what they've given up and gone after, offers they've made (which show what they want), how they've responded to offers, their record and playoff position, and whether the deal fills a real hole for them. Rank trade ideas by value to the user and by how likely that manager is to accept, and say why.
 - For waiver targets, predict who else will go after each player: managers with a roster need at that position, higher waiver priority or more FAAB left, and a history of bidding on similar players. Suggest FAAB bids based on what this league has actually paid in contested claims.
@@ -312,6 +401,15 @@ def ask(client, model: str, effort: str, d: LeagueData, history: list, question:
     return "Sorry, that took too many steps. Try a narrower question."
 
 
+def log_exchange(user: str, team: str, model: str, question: str, answer: str):
+    """Append one Q&A to logs/<user>.md (FFCOACH_LOG_DIR overrides the folder)."""
+    folder = os.environ.get("FFCOACH_LOG_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    os.makedirs(folder, exist_ok=True)
+    with open(os.path.join(folder, f"{user}.md"), "a") as f:
+        f.write(f"## {time.strftime('%Y-%m-%d %H:%M')} · {team} · {model}\n\n"
+                f"**Q:** {question}\n\n{answer}\n\n---\n\n")
+
+
 def load_session(path):
     if not path or not os.path.exists(path):
         return []
@@ -349,10 +447,12 @@ def main():
 
     def answer(q):
         try:
-            return ask(client, *route(client, q, history, args.model, args.verbose), d, history, q,
-                       args.sms, args.verbose)
+            model, effort = route(client, q, history, args.model, args.verbose)
+            a = ask(client, model, effort, d, history, q, args.sms, args.verbose)
         except anthropic.APIStatusError as e:
             return f"Claude API error ({e.status_code}): {e.message}"
+        log_exchange(os.environ.get("FFCOACH_USER", "me"), d.me.name, model, q, a)
+        return a
 
     history = load_session(args.session)
     if args.question:

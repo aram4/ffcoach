@@ -115,6 +115,7 @@ if q:
                 status.write(f"Using {model}")
                 answer = ch.ask(client, model, effort, d, st.session_state.history, q, False, False,
                                 log=lambda m: status.write(m.split("(")[0].replace("_", " ")))
+                ch.log_exchange(user, d.me.name, model, q, answer)
             except anthropic.APIStatusError as e:
                 answer = f"Claude API error ({e.status_code}): {e.message}"
             status.update(label="Done", state="complete")

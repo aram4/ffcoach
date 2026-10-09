@@ -47,6 +47,10 @@ python ffcoach.py --json out.json # raw analysis, for logging or backtesting
 
 ESPN shows some trade offers between other teams but doesn't always link them to their outcome, so acceptance odds lean on each manager's overall trading pattern.
 
+It also sees the season so far: standings with points for/against and ESPN playoff odds, every past matchup, each player's weekly points vs projection, and remaining schedules. For news it uses Claude's web search (up to 10 searches per question) to check injury, practice and roster reports.
+
+Every question and answer is saved to `logs/<name>.md` (git-ignored). The terminal chat uses `FFCOACH_USER` from `.env` as the name; the web app uses each person's login.
+
 Each question is routed by a quick Haiku check: lookups go to Claude Sonnet 5.5, strategy (trades, pickups, start/sit) to Claude Opus 5.5.
 
 ```bash
